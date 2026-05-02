@@ -26,11 +26,11 @@ pub use crate::schema::{
     ThemeColorsContent, ThemeContent, ThemeFamilyContent, ThemeStyleContent,
     WindowBackgroundContent, status_colors_refinement, syntax_overrides, theme_colors_refinement,
 };
-use crate::settings::adjust_buffer_font_size;
 pub use crate::settings::{
     AgentBufferFontSize, AgentUiFontSize, BufferLineHeight, FontFamilyName, IconThemeName,
     IconThemeSelection, ThemeAppearanceMode, ThemeName, ThemeSelection, ThemeSettings,
-    adjust_agent_buffer_font_size, adjust_agent_ui_font_size, adjust_ui_font_size,
+    adjust_agent_buffer_font_size, adjust_agent_ui_font_size, adjust_buffer_font_size,
+    adjust_ui_font_size,
     adjusted_font_size, appearance_to_mode, clamp_font_size, default_theme,
     observe_buffer_font_size_adjustment, reset_agent_buffer_font_size, reset_agent_ui_font_size,
     reset_buffer_font_size, reset_ui_font_size, set_icon_theme, set_mode, set_theme, setup_ui_font,
