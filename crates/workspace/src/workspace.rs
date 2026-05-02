@@ -726,12 +726,12 @@ pub fn prompt_for_open_path_and_open(
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
-    let paths = workspace.prompt_for_open_path(
-        options,
-        DirectoryLister::Local(workspace.project().clone(), app_state.fs.clone()),
-        window,
-        cx,
-    );
+    let lister = if workspace.project().read(cx).is_local() {
+        DirectoryLister::Local(workspace.project().clone(), app_state.fs.clone())
+    } else {
+        DirectoryLister::Project(workspace.project().clone())
+    };
+    let paths = workspace.prompt_for_open_path(options, lister, window, cx);
     let multi_workspace_handle = window.window_handle().downcast::<MultiWorkspace>();
     cx.spawn_in(window, async move |this, cx| {
         let Some(paths) = paths.await.log_err().flatten() else {
