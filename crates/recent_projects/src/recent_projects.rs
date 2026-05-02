@@ -1122,7 +1122,10 @@ impl PickerDelegate for RecentProjectsDelegate {
         let saved_remote_candidates: Vec<StringMatchCandidate> = visible_saved_remote_indices
             .iter()
             .map(|&idx| {
-                StringMatchCandidate::new(idx, &saved_remote_search_string(&self.saved_remotes[idx]))
+                StringMatchCandidate::new(
+                    idx,
+                    &saved_remote_search_string(&self.saved_remotes[idx]),
+                )
             })
             .collect();
 
@@ -1349,7 +1352,12 @@ impl PickerDelegate for RecentProjectsDelegate {
                     open_remote_project(connection_options, vec![], app_state, open_options, cx)
                         .await
                 })
-                .detach_and_prompt_err("Failed to open remote", window, cx, |_, _, _| None);
+                .detach_and_prompt_err(
+                    "Failed to open remote",
+                    window,
+                    cx,
+                    |_, _, _| None,
+                );
                 cx.emit(DismissEvent);
             }
             _ => {}
