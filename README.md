@@ -1,5 +1,12 @@
 # Zed
 
+> **This is a personal fork of [zed-industries/zed](https://github.com/zed-industries/zed) and has diverged from upstream to address a number of common issues:**
+>
+> - **Remote SSH file picker** — Cmd/Ctrl+O now opens the remote filesystem browser when connected via SSH, instead of always showing the local file picker.
+> - **Recent workspaces deduplication** — Remote workspaces are now correctly deduplicated in the recent projects list by connection identity, preventing duplicate entries after reconnecting.
+> - **Saved SSH remotes in project picker** — Configured SSH/WSL connections from settings appear directly in the project picker so you can open them without having opened them before.
+> - **Zoom In/Out affects all panels** — View → Zoom In and Zoom Out (and their keyboard shortcuts) now scale buffer, UI, agent UI, and agent buffer fonts together, instead of only the editor buffer font.
+
 [![Zed](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/zed-industries/zed/main/assets/badge/v0.json)](https://zed.dev)
 [![CI](https://github.com/zed-industries/zed/actions/workflows/run_tests.yml/badge.svg)](https://github.com/zed-industries/zed/actions/workflows/run_tests.yml)
 
