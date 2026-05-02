@@ -189,6 +189,24 @@ pub struct ResetAllZoom {
     pub persist: bool,
 }
 
+/// Increases all font sizes (buffer, UI, and agent panel) by one step.
+#[derive(PartialEq, Clone, Default, Debug, Deserialize, JsonSchema, Action)]
+#[action(namespace = zed)]
+#[serde(deny_unknown_fields)]
+pub struct ZoomIn {
+    #[serde(default)]
+    pub persist: bool,
+}
+
+/// Decreases all font sizes (buffer, UI, and agent panel) by one step.
+#[derive(PartialEq, Clone, Default, Debug, Deserialize, JsonSchema, Action)]
+#[action(namespace = zed)]
+#[serde(deny_unknown_fields)]
+pub struct ZoomOut {
+    #[serde(default)]
+    pub persist: bool,
+}
+
 pub mod editor {
     use gpui::actions;
     actions!(

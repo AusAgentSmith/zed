@@ -8,14 +8,8 @@ pub fn app_menus(cx: &mut App) -> Vec<Menu> {
     use zed_actions::Quit;
 
     let mut view_items = vec![
-        MenuItem::action(
-            "Zoom In",
-            zed_actions::IncreaseBufferFontSize { persist: false },
-        ),
-        MenuItem::action(
-            "Zoom Out",
-            zed_actions::DecreaseBufferFontSize { persist: false },
-        ),
+        MenuItem::action("Zoom In", zed_actions::ZoomIn { persist: false }),
+        MenuItem::action("Zoom Out", zed_actions::ZoomOut { persist: false }),
         MenuItem::action(
             "Reset Zoom",
             zed_actions::ResetBufferFontSize { persist: false },

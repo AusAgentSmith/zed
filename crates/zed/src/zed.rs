@@ -1079,6 +1079,60 @@ fn register_actions(
                 }
             }
         })
+        .register_action({
+            let fs = app_state.fs.clone();
+            move |_, action: &zed_actions::ZoomIn, _window, cx| {
+                if action.persist {
+                    update_settings_file(fs.clone(), cx, move |settings, cx| {
+                        let theme = ThemeSettings::get_global(cx);
+                        let _ = settings.theme.buffer_font_size.insert(
+                            f32::from(theme_settings::clamp_font_size(
+                                theme.buffer_font_size(cx) + px(1.0),
+                            ))
+                            .into(),
+                        );
+                        let _ = settings.theme.ui_font_size.insert(
+                            f32::from(theme_settings::clamp_font_size(
+                                theme.ui_font_size(cx) + px(1.0),
+                            ))
+                            .into(),
+                        );
+                    });
+                } else {
+                    theme_settings::adjust_buffer_font_size(cx, |size| size + px(1.0));
+                    theme_settings::adjust_ui_font_size(cx, |size| size + px(1.0));
+                    theme_settings::adjust_agent_ui_font_size(cx, |size| size + px(1.0));
+                    theme_settings::adjust_agent_buffer_font_size(cx, |size| size + px(1.0));
+                }
+            }
+        })
+        .register_action({
+            let fs = app_state.fs.clone();
+            move |_, action: &zed_actions::ZoomOut, _window, cx| {
+                if action.persist {
+                    update_settings_file(fs.clone(), cx, move |settings, cx| {
+                        let theme = ThemeSettings::get_global(cx);
+                        let _ = settings.theme.buffer_font_size.insert(
+                            f32::from(theme_settings::clamp_font_size(
+                                theme.buffer_font_size(cx) - px(1.0),
+                            ))
+                            .into(),
+                        );
+                        let _ = settings.theme.ui_font_size.insert(
+                            f32::from(theme_settings::clamp_font_size(
+                                theme.ui_font_size(cx) - px(1.0),
+                            ))
+                            .into(),
+                        );
+                    });
+                } else {
+                    theme_settings::adjust_buffer_font_size(cx, |size| size - px(1.0));
+                    theme_settings::adjust_ui_font_size(cx, |size| size - px(1.0));
+                    theme_settings::adjust_agent_ui_font_size(cx, |size| size - px(1.0));
+                    theme_settings::adjust_agent_buffer_font_size(cx, |size| size - px(1.0));
+                }
+            }
+        })
         .register_action(|_, _: &install_cli::RegisterZedScheme, window, cx| {
             cx.spawn_in(window, async move |workspace, cx| {
                 install_cli::register_zed_scheme(cx).await?;
