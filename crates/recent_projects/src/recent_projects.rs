@@ -17,8 +17,9 @@ use fs::Fs;
 #[cfg(target_os = "windows")]
 mod wsl_picker;
 
-use remote::RemoteConnectionOptions;
+use remote::{RemoteConnectionIdentity, RemoteConnectionOptions};
 pub use remote_connection::{RemoteConnectionModal, connect};
+use remote_connections::Connection;
 pub use remote_connections::{navigate_to_positions, open_remote_project};
 
 use disconnected_overlay::DisconnectedOverlay;
@@ -81,6 +82,7 @@ enum ProjectPickerEntry {
     OpenFolder { index: usize, positions: Vec<usize> },
     ProjectGroup(StringMatch),
     RecentProject(StringMatch),
+    SavedRemote(StringMatch),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -643,6 +645,7 @@ impl RecentProjects {
         let open_folders = get_open_folders(workspace, cx);
         let project_connection_options = workspace.project().read(cx).remote_connection_options(cx);
         let fs = Some(workspace.app_state().fs.clone());
+        let saved_remotes = collect_saved_remotes(cx);
 
         workspace.toggle_modal(window, cx, |window, cx| {
             let delegate = RecentProjectsDelegate::new(
@@ -652,6 +655,7 @@ impl RecentProjects {
                 open_folders,
                 window_project_groups,
                 project_connection_options,
+                saved_remotes,
                 ProjectPickerStyle::Modal,
             );
 
@@ -678,6 +682,7 @@ impl RecentProjects {
                 )
             })
             .unwrap_or_else(|| (Vec::new(), None, None));
+        let saved_remotes = collect_saved_remotes(cx);
 
         cx.new(|cx| {
             let delegate = RecentProjectsDelegate::new(
@@ -687,6 +692,7 @@ impl RecentProjects {
                 open_folders,
                 window_project_groups,
                 project_connection_options,
+                saved_remotes,
                 ProjectPickerStyle::Popover,
             );
             let list = Self::new(delegate, fs, 20., window, cx);
@@ -818,6 +824,7 @@ pub struct RecentProjectsDelegate {
         PathList,
         DateTime<Utc>,
     )>,
+    saved_remotes: Vec<Connection>,
     filtered_entries: Vec<ProjectPickerEntry>,
     selected_index: usize,
     render_paths: bool,
@@ -839,20 +846,24 @@ impl RecentProjectsDelegate {
         open_folders: Vec<OpenFolderEntry>,
         window_project_groups: Vec<ProjectGroupKey>,
         project_connection_options: Option<RemoteConnectionOptions>,
+        saved_remotes: Vec<Connection>,
         style: ProjectPickerStyle,
     ) -> Self {
         let render_paths = style == ProjectPickerStyle::Modal;
+        let has_any_non_local_projects =
+            project_connection_options.is_some() || !saved_remotes.is_empty();
         Self {
             workspace,
             open_folders,
             window_project_groups,
             workspaces: Vec::new(),
+            saved_remotes,
             filtered_entries: Vec::new(),
             selected_index: 0,
             create_new_window,
             render_paths,
             reset_selected_match_index: true,
-            has_any_non_local_projects: project_connection_options.is_some(),
+            has_any_non_local_projects,
             project_connection_options,
             focus_handle,
             style,
@@ -874,8 +885,9 @@ impl RecentProjectsDelegate {
             .workspaces
             .iter()
             .all(|(_, location, _, _)| matches!(location, SerializedWorkspaceLocation::Local));
-        self.has_any_non_local_projects =
-            self.project_connection_options.is_some() || has_non_local_recent;
+        self.has_any_non_local_projects = self.project_connection_options.is_some()
+            || has_non_local_recent
+            || !self.saved_remotes.is_empty();
     }
 }
 impl EventEmitter<DismissEvent> for RecentProjectsDelegate {}
@@ -926,6 +938,7 @@ impl PickerDelegate for RecentProjectsDelegate {
                 ProjectPickerEntry::OpenFolder { .. }
                     | ProjectPickerEntry::ProjectGroup(_)
                     | ProjectPickerEntry::RecentProject(_)
+                    | ProjectPickerEntry::SavedRemote(_)
             )
         )
     }
@@ -1076,6 +1089,71 @@ impl PickerDelegate for RecentProjectsDelegate {
             } else {
                 for m in recent_matches {
                     entries.push(ProjectPickerEntry::RecentProject(m));
+                }
+            }
+        }
+
+        // Saved remotes: connections from settings that are NOT already in recent projects.
+        let recent_identities: std::collections::HashSet<RemoteConnectionIdentity> = self
+            .workspaces
+            .iter()
+            .filter_map(|(_, location, _, _)| match location {
+                SerializedWorkspaceLocation::Remote(opts) => {
+                    Some(RemoteConnectionIdentity::from(opts))
+                }
+                SerializedWorkspaceLocation::Local => None,
+            })
+            .collect();
+
+        let visible_saved_remote_indices: Vec<usize> = self
+            .saved_remotes
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, conn)| {
+                let opts = RemoteConnectionOptions::from(conn.clone());
+                if recent_identities.contains(&RemoteConnectionIdentity::from(&opts)) {
+                    None
+                } else {
+                    Some(idx)
+                }
+            })
+            .collect();
+
+        let saved_remote_candidates: Vec<StringMatchCandidate> = visible_saved_remote_indices
+            .iter()
+            .map(|&idx| {
+                StringMatchCandidate::new(idx, &saved_remote_search_string(&self.saved_remotes[idx]))
+            })
+            .collect();
+
+        let saved_remote_matches = match_strings(
+            &saved_remote_candidates,
+            query,
+            case,
+            fuzzy_nucleo::LengthPenalty::On,
+            100,
+        );
+
+        let has_saved_remotes_to_show = if is_empty_query {
+            !visible_saved_remote_indices.is_empty()
+        } else {
+            !saved_remote_matches.is_empty()
+        };
+
+        if has_saved_remotes_to_show {
+            entries.push(ProjectPickerEntry::Header("Saved Remotes".into()));
+            if is_empty_query {
+                for idx in visible_saved_remote_indices {
+                    entries.push(ProjectPickerEntry::SavedRemote(StringMatch {
+                        candidate_id: idx,
+                        score: 0.0,
+                        positions: Vec::new(),
+                        string: Default::default(),
+                    }));
+                }
+            } else {
+                for m in saved_remote_matches {
+                    entries.push(ProjectPickerEntry::SavedRemote(m));
                 }
             }
         }
@@ -1245,6 +1323,35 @@ impl PickerDelegate for RecentProjectsDelegate {
                 });
                 cx.emit(DismissEvent);
             }
+            Some(ProjectPickerEntry::SavedRemote(hit)) => {
+                let Some(conn) = self.saved_remotes.get(hit.candidate_id).cloned() else {
+                    return;
+                };
+                let Some(workspace) = self.workspace.upgrade() else {
+                    return;
+                };
+                let mut connection_options = RemoteConnectionOptions::from(conn);
+                if let RemoteConnectionOptions::Ssh(ref mut ssh_opts) = connection_options {
+                    RemoteSettings::get_global(cx).fill_connection_options_from_settings(ssh_opts);
+                }
+                let app_state = workspace.read(cx).app_state().clone();
+                let replace_current_window = self.create_new_window == secondary;
+                let requesting_window = if replace_current_window {
+                    window.window_handle().downcast::<MultiWorkspace>()
+                } else {
+                    None
+                };
+                let open_options = OpenOptions {
+                    requesting_window,
+                    ..Default::default()
+                };
+                cx.spawn_in(window, async move |_, cx| {
+                    open_remote_project(connection_options, vec![], app_state, open_options, cx)
+                        .await
+                })
+                .detach_and_prompt_err("Failed to open remote", window, cx, |_, _, _| None);
+                cx.emit(DismissEvent);
+            }
             _ => {}
         }
     }
@@ -1252,7 +1359,10 @@ impl PickerDelegate for RecentProjectsDelegate {
     fn dismissed(&mut self, _window: &mut Window, _: &mut Context<Picker<Self>>) {}
 
     fn no_matches_text(&self, _window: &mut Window, _cx: &mut App) -> Option<SharedString> {
-        let text = if self.workspaces.is_empty() && self.open_folders.is_empty() {
+        let text = if self.workspaces.is_empty()
+            && self.open_folders.is_empty()
+            && self.saved_remotes.is_empty()
+        {
             "Recently opened projects will show up here".into()
         } else {
             "No matches".into()
@@ -1649,6 +1759,43 @@ impl PickerDelegate for RecentProjectsDelegate {
                         .into_any_element(),
                 )
             }
+            ProjectPickerEntry::SavedRemote(hit) => {
+                let conn = self.saved_remotes.get(hit.candidate_id)?;
+                let connection_options = RemoteConnectionOptions::from(conn.clone());
+                let display_name = connection_options.display_name();
+                let icon = icon_for_remote_connection(Some(&connection_options));
+
+                let highlighted_text = HighlightedMatch {
+                    text: display_name.clone(),
+                    highlight_positions: hit.positions.clone(),
+                    color: Color::Default,
+                };
+
+                Some(
+                    ListItem::new(ix)
+                        .toggle_state(selected)
+                        .inset(true)
+                        .spacing(ListItemSpacing::Sparse)
+                        .child(
+                            h_flex()
+                                .id("saved_remote_container")
+                                .gap_2p5()
+                                .flex_grow()
+                                .child(Icon::new(icon).color(Color::Muted))
+                                .child(
+                                    HighlightedMatchWithPaths {
+                                        prefix: None,
+                                        match_label: highlighted_text,
+                                        paths: Vec::new(),
+                                        active: false,
+                                    }
+                                    .render(window, cx),
+                                )
+                                .tooltip(Tooltip::text(SharedString::from(display_name))),
+                        )
+                        .into_any_element(),
+                )
+            }
         }
     }
 
@@ -1942,6 +2089,29 @@ impl PickerDelegate for RecentProjectsDelegate {
                 )
                 .into_any(),
         )
+    }
+}
+
+fn collect_saved_remotes(cx: &App) -> Vec<Connection> {
+    let settings = RemoteSettings::get_global(cx);
+    settings
+        .ssh_connections()
+        .map(Connection::Ssh)
+        .chain(settings.wsl_connections().map(Connection::Wsl))
+        .collect()
+}
+
+fn saved_remote_search_string(conn: &Connection) -> String {
+    match conn {
+        Connection::Ssh(ssh) => {
+            if let Some(nickname) = &ssh.nickname {
+                format!("{nickname} {}", ssh.host)
+            } else {
+                ssh.host.clone()
+            }
+        }
+        Connection::Wsl(wsl) => wsl.distro_name.clone(),
+        Connection::DevContainer(dev) => dev.name.clone(),
     }
 }
 
