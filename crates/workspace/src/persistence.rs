@@ -2594,14 +2594,24 @@ pub async fn resolve_worktree_workspaces(
     }))
     .await;
 
-    // Second pass: deduplicate by PathList.
-    // When two entries resolve to the same paths, keep the one with the
-    // more recent timestamp.
-    let mut seen: collections::HashMap<Vec<PathBuf>, usize> = collections::HashMap::default();
+    // Second pass: deduplicate by (remote identity, paths).
+    // Two entries are the same workspace only if they share both the same remote
+    // connection identity and the same set of worktree paths. A local entry and
+    // a remote entry with identical paths are different workspaces.
+    // When two entries resolve to the same key, keep the one with the more
+    // recent timestamp.
+    type DedupKey = (Option<RemoteConnectionIdentity>, Vec<PathBuf>);
+    let mut seen: collections::HashMap<DedupKey, usize> = collections::HashMap::default();
     let mut result: Vec<WorkspaceEntry> = Vec::new();
 
     for entry in resolved {
-        let key: Vec<PathBuf> = entry.2.paths().to_vec();
+        let remote_identity = match &entry.1 {
+            SerializedWorkspaceLocation::Remote(options) => {
+                Some(remote_connection_identity(options))
+            }
+            SerializedWorkspaceLocation::Local => None,
+        };
+        let key: DedupKey = (remote_identity, entry.2.paths().to_vec());
         if let Some(&existing_idx) = seen.get(&key) {
             // Keep the entry with the more recent timestamp
             if entry.3 > result[existing_idx].3 {
@@ -5066,6 +5076,121 @@ mod tests {
         // Third entry: non-git project, unchanged.
         assert_eq!(result[2].2.paths(), &[PathBuf::from("/plain-project")]);
         assert_eq!(result[2].0, WorkspaceId(4));
+    }
+
+    #[gpui::test]
+    async fn test_resolve_worktree_workspaces_remote_dedup(cx: &mut gpui::TestAppContext) {
+        use remote::{SshConnectionOptions, WslConnectionOptions};
+
+        let fs = fs::FakeFs::new(cx.executor());
+
+        let t0 = Utc::now() - chrono::Duration::hours(4);
+        let t1 = Utc::now() - chrono::Duration::hours(3);
+        let t2 = Utc::now() - chrono::Duration::hours(2);
+        let t3 = Utc::now() - chrono::Duration::hours(1);
+
+        let ssh_host_a = RemoteConnectionOptions::Ssh(SshConnectionOptions {
+            host: "hostA".into(),
+            username: Some("user".to_string()),
+            port: None,
+            ..Default::default()
+        });
+        let ssh_host_b = RemoteConnectionOptions::Ssh(SshConnectionOptions {
+            host: "hostB".into(),
+            username: Some("user".to_string()),
+            port: None,
+            ..Default::default()
+        });
+        // Same identity as ssh_host_a but with transient fields that must be ignored.
+        let ssh_host_a_variant = RemoteConnectionOptions::Ssh(SshConnectionOptions {
+            host: "hostA".into(),
+            username: Some("user".to_string()),
+            port: None,
+            nickname: Some("work".to_string()),
+            args: Some(vec!["-v".to_string()]),
+            ..Default::default()
+        });
+        let wsl_distro = RemoteConnectionOptions::Wsl(WslConnectionOptions {
+            distro_name: "Ubuntu".to_string(),
+            user: None,
+        });
+
+        let workspaces = vec![
+            // Local /foo — should dedup with the next local /foo entry.
+            (
+                WorkspaceId(1),
+                SerializedWorkspaceLocation::Local,
+                PathList::new(&["/foo"]),
+                t0,
+            ),
+            // Local /foo again — deduped, later timestamp wins.
+            (
+                WorkspaceId(2),
+                SerializedWorkspaceLocation::Local,
+                PathList::new(&["/foo"]),
+                t1,
+            ),
+            // Remote hostA /foo — same paths as local but different identity → survives.
+            (
+                WorkspaceId(3),
+                SerializedWorkspaceLocation::Remote(ssh_host_a.clone()),
+                PathList::new(&["/foo"]),
+                t2,
+            ),
+            // Remote hostA /foo again with transient fields — same identity → deduped, later wins.
+            (
+                WorkspaceId(4),
+                SerializedWorkspaceLocation::Remote(ssh_host_a_variant),
+                PathList::new(&["/foo"]),
+                t3,
+            ),
+            // Remote hostB /foo — different host → survives.
+            (
+                WorkspaceId(5),
+                SerializedWorkspaceLocation::Remote(ssh_host_b),
+                PathList::new(&["/foo"]),
+                t0,
+            ),
+            // WSL /foo — different connection type → survives.
+            (
+                WorkspaceId(6),
+                SerializedWorkspaceLocation::Remote(wsl_distro),
+                PathList::new(&["/foo"]),
+                t0,
+            ),
+        ];
+
+        let result = resolve_worktree_workspaces(workspaces, fs.as_ref()).await;
+
+        // Four distinct entries: local /foo, remote hostA /foo, remote hostB /foo, WSL /foo.
+        assert_eq!(result.len(), 4);
+
+        // Local /foo: deduped from #1 and #2; later timestamp (t1) kept.
+        assert_eq!(result[0].1, SerializedWorkspaceLocation::Local);
+        assert_eq!(result[0].2.paths(), &[PathBuf::from("/foo")]);
+        assert_eq!(result[0].3, t1);
+
+        // Remote hostA /foo: deduped from #3 and #4; later timestamp (t3) and id (4) kept.
+        assert!(matches!(
+            &result[1].1,
+            SerializedWorkspaceLocation::Remote(RemoteConnectionOptions::Ssh(o))
+                if o.host.to_string() == "hostA"
+        ));
+        assert_eq!(result[1].0, WorkspaceId(4));
+        assert_eq!(result[1].3, t3);
+
+        // Remote hostB /foo survives independently.
+        assert!(matches!(
+            &result[2].1,
+            SerializedWorkspaceLocation::Remote(RemoteConnectionOptions::Ssh(o))
+                if o.host.to_string() == "hostB"
+        ));
+
+        // WSL /foo survives independently.
+        assert!(matches!(
+            &result[3].1,
+            SerializedWorkspaceLocation::Remote(RemoteConnectionOptions::Wsl(_))
+        ));
     }
 
     #[gpui::test]
