@@ -1169,6 +1169,7 @@ impl TerminalView {
         self.terminal.update(cx, |terminal, _| {
             terminal.set_cursor_shape(self.cursor_shape);
             terminal.focus_in();
+            terminal.set_local_api_active(true);
         });
 
         let should_blink = match TerminalSettings::get_global(cx).blinking {
@@ -1190,6 +1191,7 @@ impl TerminalView {
         self.terminal.update(cx, |terminal, _| {
             terminal.focus_out();
             terminal.set_cursor_shape(CursorShape::Hollow);
+            terminal.set_local_api_active(false);
         });
         cx.notify();
     }

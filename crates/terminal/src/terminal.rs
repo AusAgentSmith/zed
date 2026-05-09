@@ -77,17 +77,105 @@ use gpui::{
 
 use crate::mappings::{colors::to_alac_rgb, keys::to_esc_str};
 
-// ─── Local API registry ──────────────────────────────────────────────────────
+// Local API registry.
 
 /// A single entry in the local-API terminal registry.
 pub struct LocalApiEntry {
     pub id: u64,
-    /// Broadcast channel for VT-encoded terminal output frames.
+    pub title: Arc<RwLock<String>>,
+    pub rows: Arc<std::sync::atomic::AtomicUsize>,
+    pub cols: Arc<std::sync::atomic::AtomicUsize>,
+    pub is_active: Arc<std::sync::atomic::AtomicBool>,
+    /// Broadcast channel for raw PTY output bytes.
     pub output_tx: Arc<broadcast::Sender<Bytes>>,
-    /// Latest serialised terminal frame (for replay on WS connect).
+    /// Raw PTY scrollback bytes retained for replay on WS connect.
     pub snapshot: Arc<RwLock<Bytes>>,
     /// Unbounded sender for bytes the WebSocket client wants to write to the PTY.
-    pub input_tx: futures::channel::mpsc::UnboundedSender<Bytes>,
+    pub input_tx: futures::channel::mpsc::UnboundedSender<LocalApiInput>,
+}
+
+#[derive(Clone)]
+pub enum LocalApiInput {
+    Bytes(Bytes),
+    Resize { rows: u16, cols: u16 },
+}
+
+#[derive(Clone)]
+pub struct LocalApiBufferInfo {
+    pub id: u64,
+    pub path: String,
+    pub language: Option<String>,
+    pub is_dirty: bool,
+    pub content: String,
+}
+
+struct LocalApiBufferRegistryInner {
+    buffers: parking_lot::Mutex<HashMap<u64, LocalApiBufferInfo>>,
+}
+
+#[derive(Clone)]
+pub struct LocalApiBufferRegistry(Arc<LocalApiBufferRegistryInner>);
+
+impl gpui::Global for LocalApiBufferRegistry {}
+
+impl LocalApiBufferRegistry {
+    pub fn new() -> Self {
+        Self(Arc::new(LocalApiBufferRegistryInner {
+            buffers: parking_lot::Mutex::new(HashMap::default()),
+        }))
+    }
+
+    pub fn upsert_buffer(&self, buffer: LocalApiBufferInfo) {
+        self.0.buffers.lock().insert(buffer.id, buffer);
+    }
+
+    pub fn remove_buffer(&self, id: u64) {
+        self.0.buffers.lock().remove(&id);
+    }
+
+    pub fn list_buffers(&self) -> Vec<LocalApiBufferInfo> {
+        self.0.buffers.lock().values().cloned().collect()
+    }
+
+    pub fn get_buffer_by_path(&self, path: &str) -> Option<LocalApiBufferInfo> {
+        self.0
+            .buffers
+            .lock()
+            .values()
+            .find(|buffer| buffer.path == path)
+            .cloned()
+    }
+}
+
+impl Default for LocalApiBufferRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn append_local_api_snapshot(
+    snapshot: &Arc<RwLock<Bytes>>,
+    bytes: &[u8],
+    max_snapshot_bytes: usize,
+) {
+    if let Ok(mut guard) = snapshot.write() {
+        let keep_from_existing = max_snapshot_bytes.saturating_sub(bytes.len());
+        let mut next = Vec::with_capacity(max_snapshot_bytes.min(guard.len() + bytes.len()));
+
+        if keep_from_existing > 0 {
+            let existing = guard.as_ref();
+            let start = existing.len().saturating_sub(keep_from_existing);
+            next.extend_from_slice(&existing[start..]);
+        }
+
+        if bytes.len() > max_snapshot_bytes {
+            next.extend_from_slice(&bytes[bytes.len() - max_snapshot_bytes..]);
+        } else {
+            next.extend_from_slice(bytes);
+        }
+
+        *guard = Bytes::from(next);
+    }
 }
 
 struct LocalApiRegistryInner {
@@ -124,9 +212,7 @@ impl LocalApiRegistry {
     }
 
     /// Lock the entry map for direct inspection (used by the Axum server).
-    pub fn lock_entries(
-        &self,
-    ) -> parking_lot::MutexGuard<'_, HashMap<u64, LocalApiEntry>> {
+    pub fn lock_entries(&self) -> parking_lot::MutexGuard<'_, HashMap<u64, LocalApiEntry>> {
         self.0.entries.lock()
     }
 
@@ -144,8 +230,6 @@ impl Default for LocalApiRegistry {
         Self::new()
     }
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
 
 actions!(
     terminal,
@@ -498,6 +582,11 @@ impl TerminalBuilder {
             input_log: Vec::new(),
             local_api_output_tx: None,
             local_api_snapshot: None,
+            local_api_title: None,
+            local_api_rows: None,
+            local_api_cols: None,
+            local_api_is_active: None,
+            local_api_input_rx: None,
             local_api_input_task: None,
             local_api_id: None,
         };
@@ -527,6 +616,16 @@ impl TerminalBuilder {
     ) -> Task<Result<TerminalBuilder>> {
         let version = release_channel::AppVersion::global(cx);
         let background_executor = cx.background_executor().clone();
+        let local_api_registry = cx
+            .has_global::<LocalApiRegistry>()
+            .then(|| cx.global::<LocalApiRegistry>().clone());
+        let local_api_max_snapshot_bytes = local_api_registry.as_ref().map(|_| {
+            TerminalSettings::get_global(cx)
+                .local_api
+                .max_scroll_history_lines
+                .min(MAX_SCROLL_HISTORY_LINES)
+                .saturating_mul(4096)
+        });
         let fut = async move {
             // Remove SHLVL so the spawned shell initializes it to 1, matching
             // the behavior of standalone terminal emulators like iTerm2/Kitty/Alacritty.
@@ -671,8 +770,48 @@ impl TerminalBuilder {
 
             let pty_info = PtyProcessInfo::new(&pty);
 
+            let mut local_api = if let Some(registry) = &local_api_registry {
+                let id = registry.next_id();
+                let (output_tx, _) = broadcast::channel(256);
+                let output_tx = Arc::new(output_tx);
+                let snapshot = Arc::new(RwLock::new(Bytes::new()));
+                let title = Arc::new(RwLock::new(String::new()));
+                let rows = Arc::new(std::sync::atomic::AtomicUsize::new(
+                    TerminalBounds::default().num_lines(),
+                ));
+                let cols = Arc::new(std::sync::atomic::AtomicUsize::new(
+                    TerminalBounds::default().num_columns(),
+                ));
+                let is_active = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let (input_tx, input_rx) = futures::channel::mpsc::unbounded::<LocalApiInput>();
+
+                registry.insert_entry(LocalApiEntry {
+                    id,
+                    title: title.clone(),
+                    rows: rows.clone(),
+                    cols: cols.clone(),
+                    is_active: is_active.clone(),
+                    output_tx: output_tx.clone(),
+                    snapshot: snapshot.clone(),
+                    input_tx,
+                });
+
+                Some((
+                    id,
+                    output_tx,
+                    snapshot,
+                    title,
+                    rows,
+                    cols,
+                    is_active,
+                    Some(input_rx),
+                ))
+            } else {
+                None
+            };
+
             //And connect them together
-            let event_loop = EventLoop::new(
+            let mut event_loop = EventLoop::new(
                 term.clone(),
                 ZedListener(events_tx),
                 pty,
@@ -680,6 +819,20 @@ impl TerminalBuilder {
                 false,
             )
             .context("failed to create event loop")?;
+
+            if let Some((_, output_tx, snapshot, _, _, _, _, _)) = &local_api {
+                let output_tx = output_tx.clone();
+                let snapshot = snapshot.clone();
+                let max_snapshot_bytes = local_api_max_snapshot_bytes
+                    .unwrap_or_else(|| scrolling_history.saturating_mul(4096));
+                event_loop = event_loop.with_output_tap(Arc::new(move |bytes| {
+                    let bytes = Bytes::copy_from_slice(bytes);
+                    append_local_api_snapshot(&snapshot, bytes.as_ref(), max_snapshot_bytes);
+                    if output_tx.receiver_count() > 0 && output_tx.send(bytes).is_err() {
+                        log::trace!("local API terminal output had no receivers");
+                    }
+                }));
+            }
 
             let pty_tx = event_loop.channel();
             let _io_thread = event_loop.spawn(); // DANGER
@@ -734,10 +887,29 @@ impl TerminalBuilder {
                 path_style,
                 #[cfg(any(test, feature = "test-support"))]
                 input_log: Vec::new(),
-                local_api_output_tx: None,
-                local_api_snapshot: None,
+                local_api_output_tx: local_api
+                    .as_ref()
+                    .map(|(_, output_tx, _, _, _, _, _, _)| output_tx.clone()),
+                local_api_snapshot: local_api
+                    .as_ref()
+                    .map(|(_, _, snapshot, _, _, _, _, _)| snapshot.clone()),
+                local_api_title: local_api
+                    .as_ref()
+                    .map(|(_, _, _, title, _, _, _, _)| title.clone()),
+                local_api_rows: local_api
+                    .as_ref()
+                    .map(|(_, _, _, _, rows, _, _, _)| rows.clone()),
+                local_api_cols: local_api
+                    .as_ref()
+                    .map(|(_, _, _, _, _, cols, _, _)| cols.clone()),
+                local_api_is_active: local_api
+                    .as_ref()
+                    .map(|(_, _, _, _, _, _, is_active, _)| is_active.clone()),
+                local_api_input_rx: local_api
+                    .as_mut()
+                    .and_then(|(_, _, _, _, _, _, _, input_rx)| input_rx.take()),
                 local_api_input_task: None,
-                local_api_id: None,
+                local_api_id: local_api.as_ref().map(|(id, _, _, _, _, _, _, _)| *id),
             };
 
             if !activation_script.is_empty() && no_task {
@@ -775,34 +947,15 @@ impl TerminalBuilder {
     }
 
     pub fn subscribe(mut self, cx: &Context<Terminal>) -> Terminal {
-        // Wire up the local API tap for PTY terminals when the registry is active.
-        if matches!(self.terminal.terminal_type, TerminalType::Pty { .. })
-            && cx.has_global::<LocalApiRegistry>()
-        {
-            let registry = cx.global::<LocalApiRegistry>().clone();
-            let id = registry.next_id();
-            let (output_tx, _) = broadcast::channel(64);
-            let output_tx = Arc::new(output_tx);
-            let snapshot = Arc::new(RwLock::new(Bytes::new()));
-            let (input_tx, input_rx) = futures::channel::mpsc::unbounded::<Bytes>();
-
-            registry.insert_entry(LocalApiEntry {
-                id,
-                output_tx: output_tx.clone(),
-                snapshot: snapshot.clone(),
-                input_tx,
-            });
-
-            self.terminal.local_api_id = Some(id);
-            self.terminal.local_api_output_tx = Some(output_tx);
-            self.terminal.local_api_snapshot = Some(snapshot);
-
-            // Spawn a task that forwards input from the WebSocket client to the PTY.
+        if let Some(input_rx) = self.terminal.local_api_input_rx.take() {
             self.terminal.local_api_input_task = Some(cx.spawn(async move |this, cx| {
                 let mut input_rx = input_rx;
-                while let Some(bytes) = input_rx.next().await {
-                    this.update(cx, |terminal, _| {
-                        terminal.write_to_pty(bytes.to_vec());
+                while let Some(input) = input_rx.next().await {
+                    this.update(cx, |terminal, _| match input {
+                        LocalApiInput::Bytes(bytes) => terminal.write_to_pty(bytes.to_vec()),
+                        LocalApiInput::Resize { rows, cols } => {
+                            terminal.resize_to_rows_cols(rows, cols);
+                        }
                     })?;
                 }
                 anyhow::Ok(())
@@ -871,11 +1024,11 @@ impl TerminalBuilder {
 
             // Clean up the local API registry entry when the PTY exits.
             if let Some(id) = local_api_id {
-                let _ = terminal.update(cx, |_, cx| {
+                terminal.update(cx, |_, cx| {
                     if cx.has_global::<LocalApiRegistry>() {
                         cx.global::<LocalApiRegistry>().remove_entry(id);
                     }
-                });
+                })?;
             }
 
             anyhow::Ok(())
@@ -1010,9 +1163,14 @@ pub struct Terminal {
     path_style: PathStyle,
     #[cfg(any(test, feature = "test-support"))]
     input_log: Vec<Vec<u8>>,
-    // Local API tap – Some only for PTY terminals when the registry is active.
+    // Local API tap. Some only for PTY terminals when the registry is active.
     local_api_output_tx: Option<Arc<broadcast::Sender<Bytes>>>,
     local_api_snapshot: Option<Arc<RwLock<Bytes>>>,
+    local_api_title: Option<Arc<RwLock<String>>>,
+    local_api_rows: Option<Arc<std::sync::atomic::AtomicUsize>>,
+    local_api_cols: Option<Arc<std::sync::atomic::AtomicUsize>>,
+    local_api_is_active: Option<Arc<std::sync::atomic::AtomicBool>>,
+    local_api_input_rx: Option<futures::channel::mpsc::UnboundedReceiver<LocalApiInput>>,
     local_api_input_task: Option<Task<Result<(), anyhow::Error>>>,
     local_api_id: Option<u64>,
 }
@@ -1124,7 +1282,7 @@ impl Terminal {
                     info.emit_title_changed_if_changed(cx);
                 }
 
-                self.broadcast_local_api_frame();
+                self.update_local_api_metadata();
             }
             AlacTermEvent::ColorRequest(index, format) => {
                 // It's important that the color request is processed here to retain relative order
@@ -1612,31 +1770,45 @@ impl Terminal {
         }
     }
 
-    /// Serialize the current visible terminal grid as a VT byte sequence and
-    /// broadcast it to any active local-API WebSocket subscribers.
-    fn broadcast_local_api_frame(&self) {
-        let Some(ref output_tx) = self.local_api_output_tx else {
-            return;
-        };
-        // Skip broadcasting when there are no subscribers to avoid unnecessary work.
-        if output_tx.receiver_count() == 0 {
+    fn resize_to_rows_cols(&mut self, rows: u16, cols: u16) {
+        if rows == 0 || cols == 0 {
             return;
         }
-        let frame = serialize_terminal_to_vt(&self.term.lock());
-        if let Some(ref snapshot) = self.local_api_snapshot {
-            if let Ok(mut guard) = snapshot.write() {
-                *guard = frame.clone();
-            }
-        }
-        let _ = output_tx.send(frame);
+
+        let mut bounds = self.last_content.terminal_bounds;
+        bounds.bounds.size.height = bounds.line_height * rows as f32;
+        bounds.bounds.size.width = bounds.cell_width * cols as f32;
+        self.set_size(bounds);
     }
 
-    /// Return a broadcast receiver for live VT-encoded terminal frames.
+    pub fn set_local_api_active(&self, is_active: bool) {
+        if let Some(is_active_state) = &self.local_api_is_active {
+            is_active_state.store(is_active, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    fn update_local_api_metadata(&self) {
+        if let Some(title) = &self.local_api_title
+            && let Ok(mut title) = title.write()
+        {
+            *title = self.title(false);
+        }
+
+        let bounds = self.last_content.terminal_bounds;
+        if let Some(rows) = &self.local_api_rows {
+            rows.store(bounds.num_lines(), std::sync::atomic::Ordering::Relaxed);
+        }
+        if let Some(cols) = &self.local_api_cols {
+            cols.store(bounds.num_columns(), std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Return a broadcast receiver for live raw PTY output bytes.
     pub fn subscribe_local_api_output(&self) -> Option<broadcast::Receiver<Bytes>> {
         self.local_api_output_tx.as_ref().map(|tx| tx.subscribe())
     }
 
-    /// Return the latest serialised terminal snapshot (for replay on WS connect).
+    /// Return the retained raw PTY output snapshot (for replay on WS connect).
     pub fn local_api_snapshot(&self) -> Option<Arc<RwLock<Bytes>>> {
         self.local_api_snapshot.clone()
     }
@@ -2581,184 +2753,6 @@ fn task_summary(task: &TaskState, exit_status: Option<ExitStatus>) -> (bool, Str
 ///   the cursor's `point` is not updated to the new line and column values
 ///
 /// * ??? there could be more consequences, and any further "proper" streaming from the PTY might bug and/or panic.
-/// Encode the current visible terminal state as an ANSI/VT byte sequence that
-/// xterm.js can consume directly. The output clears the screen and redraws all
-/// visible cells with their colours and text attributes.
-///
-/// Scrollback is intentionally excluded – callers that need scrollback (e.g. the
-/// initial WS snapshot) should iterate the grid directly before calling this.
-fn serialize_terminal_to_vt(term: &Term<ZedListener>) -> Bytes {
-    use alacritty_terminal::term::cell::Flags;
-    use alacritty_terminal::vte::ansi::Color;
-
-    let grid = term.grid();
-    let screen_rows = grid.screen_lines();
-    let cols = grid.columns();
-    let display_offset = grid.display_offset() as i32;
-    let content = term.renderable_content();
-    let cursor = content.cursor.point;
-
-    // ~12 bytes per cell is a safe upper bound for the average case.
-    let mut out = Vec::with_capacity(screen_rows * cols * 12 + 64);
-
-    // Hide cursor, erase display, move to home.
-    out.extend_from_slice(b"\x1b[?25l\x1b[2J\x1b[H");
-
-    let mut last_fg: Option<Color> = None;
-    let mut last_bg: Option<Color> = None;
-    let mut last_flags = Flags::empty();
-
-    for row_idx in 0..screen_rows {
-        if row_idx > 0 {
-            // Explicit cursor positioning avoids accumulated wrap-around errors.
-            let pos = format!("\x1b[{};1H", row_idx + 1);
-            out.extend_from_slice(pos.as_bytes());
-            // Reset SGR tracking at the start of each new line.
-            last_fg = None;
-            last_bg = None;
-            last_flags = Flags::empty();
-        }
-
-        // grid line index for this viewport row: viewport_row = grid_line + display_offset
-        // → grid_line = viewport_row - display_offset
-        let line = Line(row_idx as i32 - display_offset);
-        let row = &grid[line];
-
-        for col_idx in 0..cols {
-            let cell = &row[Column(col_idx)];
-
-            // Skip wide-char spacers – the preceding wide char already covers the column.
-            if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
-                continue;
-            }
-
-            let attr_flags = cell.flags
-                & (Flags::BOLD
-                    | Flags::DIM
-                    | Flags::ITALIC
-                    | Flags::UNDERLINE
-                    | Flags::STRIKEOUT
-                    | Flags::INVERSE
-                    | Flags::HIDDEN);
-
-            let sgr_changed = last_fg.as_ref() != Some(&cell.fg)
-                || last_bg.as_ref() != Some(&cell.bg)
-                || last_flags != attr_flags;
-
-            if sgr_changed {
-                last_fg = Some(cell.fg);
-                last_bg = Some(cell.bg);
-                last_flags = attr_flags;
-
-                // Emit a single SGR sequence that resets and applies all attributes.
-                out.extend_from_slice(b"\x1b[0");
-                if attr_flags.contains(Flags::BOLD) {
-                    out.extend_from_slice(b";1");
-                }
-                if attr_flags.contains(Flags::DIM) {
-                    out.extend_from_slice(b";2");
-                }
-                if attr_flags.contains(Flags::ITALIC) {
-                    out.extend_from_slice(b";3");
-                }
-                if attr_flags.contains(Flags::UNDERLINE) {
-                    out.extend_from_slice(b";4");
-                }
-                if attr_flags.contains(Flags::INVERSE) {
-                    out.extend_from_slice(b";7");
-                }
-                if attr_flags.contains(Flags::HIDDEN) {
-                    out.extend_from_slice(b";8");
-                }
-                if attr_flags.contains(Flags::STRIKEOUT) {
-                    out.extend_from_slice(b";9");
-                }
-                write_color_sgr(&mut out, cell.fg, false);
-                write_color_sgr(&mut out, cell.bg, true);
-                out.push(b'm');
-            }
-
-            // Write the cell character (null is treated as a space).
-            let ch = if cell.c == '\0' { ' ' } else { cell.c };
-            let mut buf = [0u8; 4];
-            out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
-        }
-    }
-
-    // cursor.line is in grid coordinates; convert to 1-based viewport row.
-    let cursor_viewport_row = (cursor.line.0 + display_offset + 1).max(1);
-    let cursor_viewport_col = cursor.column.0 + 1;
-    let cursor_seq = format!(
-        "\x1b[0m\x1b[{};{}H\x1b[?25h",
-        cursor_viewport_row, cursor_viewport_col,
-    );
-    out.extend_from_slice(cursor_seq.as_bytes());
-
-    Bytes::from(out)
-}
-
-/// Append the ANSI SGR colour parameter for `color` onto `buf`.
-/// `is_bg` selects the background (48/49) vs foreground (38/39) parameter set.
-fn write_color_sgr(buf: &mut Vec<u8>, color: alacritty_terminal::vte::ansi::Color, is_bg: bool) {
-    use alacritty_terminal::vte::ansi::{Color, NamedColor};
-    match color {
-        Color::Named(named) => {
-            let code = match named {
-                NamedColor::Black => 0u8,
-                NamedColor::Red => 1,
-                NamedColor::Green => 2,
-                NamedColor::Yellow => 3,
-                NamedColor::Blue => 4,
-                NamedColor::Magenta => 5,
-                NamedColor::Cyan => 6,
-                NamedColor::White => 7,
-                NamedColor::BrightBlack => 8,
-                NamedColor::BrightRed => 9,
-                NamedColor::BrightGreen => 10,
-                NamedColor::BrightYellow => 11,
-                NamedColor::BrightBlue => 12,
-                NamedColor::BrightMagenta => 13,
-                NamedColor::BrightCyan => 14,
-                NamedColor::BrightWhite => 15,
-                // Default/special colours – emit "default colour" reset.
-                _ => {
-                    buf.extend_from_slice(if is_bg { b";49" } else { b";39" });
-                    return;
-                }
-            };
-            if code < 8 {
-                let base = if is_bg { 40u8 } else { 30u8 };
-                buf.push(b';');
-                buf.extend_from_slice(itoa_u8(base + code).as_bytes());
-            } else {
-                let base = if is_bg { 100u8 } else { 90u8 };
-                buf.push(b';');
-                buf.extend_from_slice(itoa_u8(base + (code - 8)).as_bytes());
-            }
-        }
-        Color::Spec(rgb) => {
-            let prefix = if is_bg { ";48;2;" } else { ";38;2;" };
-            buf.extend_from_slice(prefix.as_bytes());
-            buf.extend_from_slice(
-                format!("{};{};{}", rgb.r, rgb.g, rgb.b).as_bytes(),
-            );
-        }
-        Color::Indexed(idx) => {
-            let prefix = if is_bg { ";48;5;" } else { ";38;5;" };
-            buf.extend_from_slice(prefix.as_bytes());
-            buf.extend_from_slice(itoa_u8(idx).as_bytes());
-        }
-    }
-}
-
-/// Fast single-byte integer to string (avoids heap allocation for values < 256).
-fn itoa_u8(v: u8) -> &'static str {
-    // Pre-computed lookup for all u8 values.
-    static TABLE: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
-    let table = TABLE.get_or_init(|| (0u16..=255).map(|i| i.to_string()).collect());
-    &table[v as usize]
-}
-
 ///   Still, subsequent `append_text_to_term` invocations are possible and display the contents correctly.
 ///
 /// Despite the quirks, this is the simplest approach to appending text to the terminal: its alternative, `grid_mut` manipulations,

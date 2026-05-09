@@ -61,6 +61,7 @@ pub struct TerminalSettings {
 pub struct LocalApiSettings {
     pub enabled: bool,
     pub port: u16,
+    pub max_scroll_history_lines: usize,
 }
 
 #[derive(Copy, Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -148,6 +149,9 @@ impl settings::Settings for TerminalSettings {
                 LocalApiSettings {
                     enabled: cfg.and_then(|c| c.enabled).unwrap_or(false),
                     port: cfg.and_then(|c| c.port).unwrap_or(7700),
+                    max_scroll_history_lines: cfg
+                        .and_then(|c| c.max_scroll_history_lines)
+                        .unwrap_or(10000),
                 }
             },
         }

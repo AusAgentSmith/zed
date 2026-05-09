@@ -133,6 +133,7 @@ use std::{
 };
 
 use task_store::TaskStore;
+use terminal::{LocalApiBufferInfo, LocalApiBufferRegistry};
 use terminals::Terminals;
 use text::{Anchor, BufferId, Point, Rope};
 use toolchain_store::EmptyToolchainStore;
@@ -203,6 +204,29 @@ pub enum OpenedBufferEvent {
     Disconnected,
     Ok(BufferId),
     Err(BufferId, Arc<anyhow::Error>),
+}
+
+fn update_local_api_buffer(buffer: &Entity<Buffer>, cx: &mut App) {
+    if !cx.has_global::<LocalApiBufferRegistry>() {
+        return;
+    }
+
+    let buffer = buffer.read(cx);
+    let Some(file) = buffer.file() else {
+        return;
+    };
+    let snapshot = buffer.text_snapshot();
+    let info = LocalApiBufferInfo {
+        id: buffer.remote_id().to_proto(),
+        path: file.full_path(cx).to_string_lossy().into_owned(),
+        language: buffer
+            .language()
+            .map(|language| language.name().to_string()),
+        is_dirty: buffer.is_dirty(),
+        content: snapshot.text(),
+    };
+
+    cx.global::<LocalApiBufferRegistry>().upsert_buffer(info);
 }
 
 /// Semantics-aware entity that is relevant to one or more [`Worktree`] with the files.
@@ -3293,8 +3317,10 @@ impl Project {
         }
 
         self.request_buffer_diff_recalculation(buffer, cx);
+        update_local_api_buffer(buffer, cx);
 
         cx.subscribe(buffer, |this, buffer, event, cx| {
+            update_local_api_buffer(&buffer, cx);
             this.on_buffer_event(buffer, event, cx);
         })
         .detach();
@@ -3460,6 +3486,10 @@ impl Project {
                 self.register_buffer(buffer, cx).log_err();
             }
             BufferStoreEvent::BufferDropped(buffer_id) => {
+                if cx.has_global::<LocalApiBufferRegistry>() {
+                    cx.global::<LocalApiBufferRegistry>()
+                        .remove_buffer(buffer_id.to_proto());
+                }
                 if let Some(ref remote_client) = self.remote_client {
                     remote_client
                         .read(cx)

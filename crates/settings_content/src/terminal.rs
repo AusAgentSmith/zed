@@ -199,6 +199,10 @@ pub struct LocalApiSettingsContent {
     ///
     /// Default: 7700
     pub port: Option<u16>,
+    /// Number of terminal scrollback lines retained for mobile companion replay.
+    ///
+    /// Default: 10000
+    pub max_scroll_history_lines: Option<usize>,
 }
 
 /// Shell configuration to open the terminal with.
