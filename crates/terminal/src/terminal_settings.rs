@@ -53,6 +53,14 @@ pub struct TerminalSettings {
     pub path_hyperlink_timeout_ms: u64,
     pub show_count_badge: bool,
     pub bell: TerminalBell,
+    pub local_api: LocalApiSettings,
+}
+
+/// Settings for the local WebSocket API server.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct LocalApiSettings {
+    pub enabled: bool,
+    pub port: u16,
 }
 
 #[derive(Copy, Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -135,6 +143,13 @@ impl settings::Settings for TerminalSettings {
             path_hyperlink_timeout_ms: project_content.path_hyperlink_timeout_ms.unwrap(),
             show_count_badge: user_content.show_count_badge.unwrap(),
             bell: user_content.bell.unwrap(),
+            local_api: {
+                let cfg = user_content.local_api.as_ref();
+                LocalApiSettings {
+                    enabled: cfg.and_then(|c| c.enabled).unwrap_or(false),
+                    port: cfg.and_then(|c| c.port).unwrap_or(7700),
+                }
+            },
         }
     }
 }

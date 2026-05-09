@@ -17750,6 +17750,7 @@ dependencies = [
  "alacritty_terminal",
  "anyhow",
  "async-channel 2.5.0",
+ "bytes 1.11.1",
  "collections",
  "futures 0.3.32",
  "futures-lite 1.13.0",
@@ -17770,6 +17771,7 @@ dependencies = [
  "theme",
  "theme_settings",
  "thiserror 2.0.17",
+ "tokio",
  "url",
  "urlencoding",
  "util",
@@ -22527,6 +22529,7 @@ dependencies = [
  "zed-reqwest",
  "zed_actions",
  "zed_env_vars",
+ "zed_local_api",
  "zlog",
  "zlog_settings",
  "ztracing",
@@ -22714,6 +22717,24 @@ name = "zed_html"
 version = "0.3.1"
 dependencies = [
  "zed_extension_api 0.7.0",
+]
+
+[[package]]
+name = "zed_local_api"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "bytes 1.11.1",
+ "futures 0.3.32",
+ "gpui",
+ "log",
+ "serde",
+ "serde_json",
+ "settings",
+ "terminal",
+ "tokio",
+ "tower-http 0.4.4",
 ]
 
 [[package]]

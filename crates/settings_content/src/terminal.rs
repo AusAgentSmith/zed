@@ -183,6 +183,22 @@ pub struct TerminalSettingsContent {
     ///
     /// Default: "system"
     pub bell: Option<TerminalBell>,
+    /// Settings for the local WebSocket API (used by the mobile companion app).
+    pub local_api: Option<LocalApiSettingsContent>,
+}
+
+/// Configuration for the local WebSocket API server.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+pub struct LocalApiSettingsContent {
+    /// Enable the local WebSocket API server. When enabled, Zed listens on localhost
+    /// for connections from the mobile companion app.
+    ///
+    /// Default: false
+    pub enabled: Option<bool>,
+    /// Port for the local API server to listen on.
+    ///
+    /// Default: 7700
+    pub port: Option<u16>,
 }
 
 /// Shell configuration to open the terminal with.

@@ -22,6 +22,7 @@ doctest = false
 [dependencies]
 async-channel.workspace = true
 alacritty_terminal.workspace = true
+bytes.workspace = true
 anyhow.workspace = true
 collections.workspace = true
 futures.workspace = true
@@ -40,6 +41,7 @@ task.workspace = true
 theme.workspace = true
 theme_settings.workspace = true
 thiserror.workspace = true
+tokio = { workspace = true, features = ["sync"] }
 url.workspace = true
 util.workspace = true
 urlencoding.workspace = true
